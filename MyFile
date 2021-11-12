@@ -1,0 +1,654 @@
+#include <iostream>
+#include "../LogEntry/StdOutLogInterface.h"
+#include "../DSPBoard/DspApi/DspApi.h"
+#include "../EnvironmentBoard/EnvironmentBoard.h"
+//#include "../PumpController/PumpControllerInterface.h"
+#include "../DBOTLOracle/DBOTLOracle.h"
+
+
+#include "../QPatchConfiguration/QPatchConfiguration.h"///
+#include"../EtherCatMaster/EtherCatMaster.h"///
+
+#include <fstream>  //for creating a csv file
+#include <string>
+
+#include "../PneumaticPressureController/PressureMeasurementsEtherCat.h"
+#include "../PiezoPressureControllers/PressureMeasurements.h"
+#include "../PneumaticPressureController/PressureMeasurementsEtherCat.h"
+
+//int main(int argc, char* argv[]);/////MAL
+int pumpChannel;////MAL
+int* pPumpChannel = &pumpChannel;//MAL
+tstring PresProtocolFilePath;
+tstring* pPresProtocolFilePath = &PresProtocolFilePath;//MAL
+//auto it=0;//MAL
+
+
+
+class MyLogInterface : public LogInterface
+{
+public:
+  void OnLogEntry(const LogEntry& entry) override;
+
+};
+
+void MyLogInterface::OnLogEntry(const LogEntry& entry)
+{
+  tostringstream ostr;
+  ostr << entry.GetInfo() << " Type: " << entry.GetTypeString() << " Log: " << entry.str() << " " << StdClass::LocalTimeString(entry.GetUTCTimestamp()) << "\n";
+  tcout << ostr.str();
+  OutputDebugOnlyString(ostr.str().c_str());
+
+}
+
+MyLogInterface theLog;
+
+
+//StdOutLogInterface theLog;
+
+class DataReceiverClass : public ObserverTemplate< DSPAPI::DspDataReadyEvent>
+{
+public:
+  DataReceiverClass(DSPAPI::DspApi *pdsp);
+  void OnEvent(DSPAPI::DspDataReadyEvent* pDspDataReadyEvent) override;
+  void storeSweepDataToFile(DSPSweepData* pSweep, int sweepCount);
+  StdClass::Event dataReceivedEvent;
+
+private:
+  DSPAPI::DspApi* pDSP{ nullptr };
+  std::vector<int> m_sweepCount;
+
+};
+
+DataReceiverClass::DataReceiverClass(DSPAPI::DspApi* pdsp) : ObserverTemplate<DSPAPI::DspDataReadyEvent>(_T("DataReceiverClass")), dataReceivedEvent(_T("DataReceived"), false, false)
+{
+  pDSP = pdsp;
+  m_sweepCount.assign(pDSP->GetNumChannels(), 0);
+  std::cout << "recorded channel"<<pDSP->GetNumChannels() << std::endl;///to check if it shows the channel
+}
+
+void DataReceiverClass::OnEvent(DSPAPI::DspDataReadyEvent* pDspDataReadyEvent)
+{
+  DSPSweepData* pSweep;
+
+  int remainingSweeps = pDSP->GetSweepData(pDspDataReadyEvent->m_channel, &pSweep);
+
+  if (nullptr == pSweep)
+  {
+    return;
+  }
+  if ((pSweep)->m_sweepType == SWEEPTYPE_COMPOUND_RESPONSE)
+  {
+    m_sweepCount[pDspDataReadyEvent->m_channel]++;
+  }
+
+  storeSweepDataToFile(pSweep, m_sweepCount[pDspDataReadyEvent->m_channel]);
+  dataReceivedEvent.Set();
+}
+
+void DataReceiverClass::storeSweepDataToFile(DSPSweepData* pSweep, int sweepCount)
+{
+  TRY_BLOCK_START
+  static int fileindex = 0;
+  double zeroTime = StdClass::GetUTCTime();
+  tstring chipBarcode = _T("0123456789");
+  int chipUnit = pSweep->m_chipUnit;
+  bool breakInSweep(false);
+  int experimentIndex = 0;
+
+  ASSAY::SweepData sweepData(zeroTime);
+  sweepData.m_compoundIndex = (U32)pSweep->GetCompoundPeriod();
+
+
+
+  
+
+
+  if (255 == sweepData.m_compoundIndex)
+  {
+    sweepData.m_compoundIndex = -1;
+    breakInSweep = true;
+  }
+
+  sweepData.m_MTPPosition = -1;
+  sweepData.m_CompoundTypeID = ASSAY::CompoundTypeEnum::INVALID_COMPOUND_TYPE;
+  sweepData.m_experimentTrialCount = -1;
+  
+  sweepData.m_chipBarcode = chipBarcode;
+  sweepData.m_chipUnit = chipUnit;
+  sweepData.m_ExperimentIndex = experimentIndex;
+
+  sweepData.m_JobID = 1;
+
+  sweepData.m_pSweepData = pSweep;
+  sweepData.m_sweepCount = sweepCount; //m_sweepCount[chipUnit];//pSweep->GetSweepCount();
+  //sweepData.m_sweepCount = m_sweepCount[chipUnit];
+
+  std::ostringstream filename;
+
+  filename << "Sweep" << "F" << std::setw(6) << std::setfill('0') << fileindex << "CU" << std::setw(2) << std::setfill('0') << pSweep->m_chipUnit << "T" << std::setw(6) << std::setfill('0') << pSweep->m_sweepType << ".dat";
+  fileindex++;
+  std::ofstream writeSweep(filename.str().c_str());// , ios::te:::binary);
+ // std::cout << "------------>"<<"Recorded Sweep:  " << sweepData.m_pSweepData <<std::endl<< "Recorded Counts :" << sweepData.m_sweepCount << std::endl;
+  auto SweepCurrent{ 0 };
+  I16* mdata = sweepData.m_pSweepData->m_pData;
+  double scaleF = sweepData.m_pSweepData->m_scalingFactor;
+    
+  
+  //--------------------------------------------------------------------------------------
+  /* Conversion from nA to mBar
+  -100 nA==1375 mBar
+  100 nA==600 mBar
+    */
+  ASSAY::VoltageProtocol vp;
+  
+  sweepData.m_compoundIndex = (U32)pSweep->GetCompoundPeriod();
+
+  //double ConvFactor = -3.875; //original pressure sensor KP236N
+  double ConvFactor = -3.75;
+  //double ConvB = 987.5; // original pressure sensor KP236N
+  double ConvB = 775;
+  double Ambient_pres = 1013.25;
+  //double MaxPressofInfineon = 1375;/*mBar*/ 
+  //double MinPressofInfineon = 600;/*mBar*/ 
+  double ConvPressmBar = 0;
+  double RelativePress = 0;
+  unsigned int fileSeq;
+
+
+   
+  //creating a file to record data
+    
+  std::ofstream myfileOut;// , std::ios::app;
+  std::ifstream myfileIn;
+  myfileIn.open("Recorded_PressureARQ_Output_Data.csv",std::ios_base::in);
+
+  // If "sequenceFile.txt" exists, read the last sequence from it and increment it by 1.
+  if (myfileIn.is_open())
+  {
+    myfileIn >> fileSeq;
+    fileSeq++;
+  }
+  else
+      fileSeq = 1;// if it does not exist, start from sequence 1
+  
+  // Assume newDataAvailable = true
+  bool newDataAvailable = true;
+
+  if (newDataAvailable) {
+    tstd::tofstream myfile;
+    
+    std::string fileName = "Recorded_PressureARQ_Output_Data" + std::to_string(fileSeq) + /*std::to_string(zeroTime)*/ +".csv";
+    
+    std::cout << "File Name is " << fileName << std::endl;
+
+    myfile.open(fileName, std::ios_base::app);
+
+
+
+    myfile << "Channel No:" << "," << *pPumpChannel << "\n" << "Voltage Protocol No : " << ", " << "MAL(0 voltage)" << "," << "Pressure Protocol filepath:" << ", " << *pPresProtocolFilePath << "\n";//MAL added to get the info about argv and PressChannel
+
+
+
+    myfile << "i" << "," << "Time(ms)" << "," <<"Current(pA)"<<","<<"Pressure(mBar)"<< "," <<"RelativePres"<< "\n";
+    //myfile.close();
+
+  
+
+  int i=0;
+  double Current=0;
+  double my_time = 0;
+  double voltage = 0;
+  //const double Resist = 10.0;//MOhm  //it is for the voltage calculations
+  
+
+  for (i = 0; i < (int)sweepData.m_pSweepData->m_numSamples; i++)
+  {
+    
+    Current = sweepData.m_pSweepData->m_pData[i];
+    Current *= (sweepData.m_pSweepData->m_scalingFactor * 1E12);  // Convert value to pA
+    
+    
+      ConvPressmBar = ConvFactor * Current / 1000/*conversion to nA*/+ConvB; /*mBar*/
+      RelativePress = ConvPressmBar - Ambient_pres;//Relatively to Ambient pressure
+      //voltage = Current * Resist / 1000;//mV
+    
+    myfile << i << "," << my_time << "," <<Current<<","<< ConvPressmBar <<","<<RelativePress <<std::endl;
+        my_time += 1000.0 / double(sweepData.m_pSweepData->m_freqHz);
+  }
+  myfileOut.open("Recorded_PressureARQ_Output_Data.csv", std::ios_base::out);
+  myfileOut << fileSeq;
+  }//the end of the "if" loop of checking the existence of the csv file
+
+  
+
+  //myfile.close();
+
+  
+
+    
+  //------------------------------------------------------------------------------------
+  sweepData.Serialize(writeSweep);
+  sweepData.m_pSweepData = 0;
+  writeSweep.close();
+  TRY_BLOCK_END
+
+}
+
+
+int main(int argc, char *argv[])
+{
+  if (argc == 2)
+  {
+    std::cout << "Argument recieved:\n" << argv[1] << std::endl;
+  }
+  if (argc != 2)
+  {
+    std::cout << "Expecting one argument" << std::endl;
+    return -1;
+    
+  }
+  //tstring PresProtocolFilePath;
+  tstring* pPresProtocolFilePath = &PresProtocolFilePath;//MAL
+
+
+
+  FILE* file;
+  if (file = fopen(argv[1], "r")) {
+    fclose(file);
+    printf("file exists\n");
+    std::string fileName = argv[1];
+    PresProtocolFilePath = str_to_tstr(fileName);
+    //tstring PresProtocolFILENAME = getFilename(PresProtocolFilePath);//splits the filename from file path
+    //printf("PresProtocolFilename is\n");
+    //tcout << PresProtocolFILENAME << "\n";
+  }
+  else {
+    printf("file doesn't exist\n");
+  }
+
+  
+
+
+  //Initialization of Pneumatic Festo System
+  //ETHERCAT_MASTER::EtherCatMaster::InitEcMaster(QPatchConfiguration::getConfigurationFilename());
+  //PumpControllerInterface* pPump = PumpControllerInterface::StartFestoPumpController(_T("PressureARQ"), _T("C:/QPatchII/Configuration"));
+  //ETHERCAT_MASTER::EtherCatMaster::getInstance().StartEcMaster();
+
+  
+
+  PumpControllerInterface* pPump = nullptr;   //already initialized by StartFestoPumpController
+  //int pumpChannel(0);
+  //int pressure_Pa{ 11 * 1000/*(kPa)*/ };// which is equal to x/100 mBar
+  double slope{ 0.0 };
+  bool bStable = true;//for Pneumatic Pressure Sys initialization
+
+  
+  
+  EnvironmentBoard env;
+  try
+  {
+    std::cout << "Pressure Measurement Device Test!\n";
+
+
+    std::cout << "Open database connection\n";
+    DBConnection::DatabaseConnectID connectID(_T("MePMJ"), _T("srv-cop-oracle"), _T("EARTH"), DBConnection::DBOTLOracle::DEFAULT_PORT_NR);
+    DBConnection::DatabaseUser user(_T("PMJ"), _T("PMJ"));
+
+    DBConnection::DBOTLOracle database(connectID, user);
+    std::cout << "*************************\n";
+
+    std::cout << "Read list of voltage protocols from database\n";
+    DBConnection::DBInterface::IdNameMap vpNameMap = database.getVoltageProtocolIDNameMap();
+    if (vpNameMap.empty())
+    {
+      throw std::exception("no voltage protocols in database");
+    }
+        
+    // Print vp name list
+    /*std::cout << "Voltage protocols\n";
+    for (std::pair< int, tstring > idname : vpNameMap)
+    {
+      tstd::tcout << _T("ID: ") << idname.first << _T("\t\t Name: ") << idname.second << "\n";
+    }*/
+    
+    std::cout << "*************************\n";
+
+    //Select voltage protocol from list
+    ASSAY::VoltageProtocol vp;
+        
+    //auto it = vpNameMap.begin(); // to select the first voltage protocol
+    
+    auto it = vpNameMap.find(2001); //select voltage protocol MAL(zero protocol) from Earth DB
+    
+    tstd::tcout << _T("Select voltage protocol ID: ") << it->first << _T(", Name: ") << it->second << _T("\n");
+
+    ///trial MAL
+
+   
+    database.GetVoltageProtocol(it->first, vp);
+
+    std::cout << "Start environment board\n";
+
+    tstd::tstring comport = _T("COM2");
+    if (!env.Open(comport))
+    {
+      throw std::exception("Could not start environmentboard");
+    }
+    if (!env.LockCabinet())
+    {
+      throw std::exception("Unable to lock cabinet");
+    }
+
+    Sleep(2000); // Make sure the chip lock is open (after a crash)
+    std::cout << "*************************\n";
+
+    std::cout << "Start DSP\n";
+
+    bool resetDspBoard{ true };
+    bool noMessagePump{ true };
+    DSPAPI::DspApi dsp(resetDspBoard, noMessagePump);
+    DataReceiverClass dataReceiverClass(&dsp);
+    //DSPSweepData* pSweep; //MAL trial to access to StoretoFile method of observer class
+    dsp.m_dataReadyEvent.Attach(dataReceiverClass);
+    std::cout << "*************************\n";
+
+
+
+    std::cout << "Start Pump controller\n";
+    tstring path(_T("."));
+    //tstring applicationName(_T("PumpMeas"));
+
+
+    //tstring PresProtocolFileName;//already declared above
+    //tstring path(_T("C:/QPatchII/Configuration"));  //c:\\QPatchII\\Configuration\\QPatchII.ini    C:/QPatchII/Configuration
+    tstring applicationName(_T("QPatchPressureARQ"));
+
+    
+    tstring outputDataPath(_T("C:/QPatchII/Tools"));  //PressureMeasurementDeviceOutputData/
+    int repeats = 1;
+
+    //initialization of pressure protocol reading(StrimmelEtherCat object initializes EtherCat simultaneously:
+
+    //new Preumatic Festo initialization:
+
+    /*
+    ETHERCAT_MASTER::EtherCatMaster::InitEcMaster(QPatchConfiguration::getConfigurationFilename());
+    StrimmelEtherCat strimmelEtherCat;  // also invoke StartEcMaster();
+    strimmelEtherCat.samplePressureChannels(StrimmelPathFileName, repeats, outputDataPath, path);
+    */
+
+
+    //strimmelEtherCat.getPump().SetPressure(123);
+
+     // any pump controller initialization:
+    PumpControllerInterface* pPump;
+    if (QPatchConfiguration::isEtherCatMasterUsed())
+    {
+      ETHERCAT_MASTER::EtherCatMaster::InitEcMaster(QPatchConfiguration::getConfigurationFilename());
+      pPump = PumpControllerInterface::StartFestoPumpController(applicationName, path);
+      ETHERCAT_MASTER::EtherCatMaster::getInstance().StartEcMaster();
+    }
+    else
+    {
+      pPump = PumpControllerInterface::StartFestoPumpController(applicationName, path);
+
+    }
+
+
+    //pPump->PowerPumps(true);// placed it to the FOR loop
+
+    /*if (QPatchConfiguration::isEtherCatMasterUsed())
+    {
+      StrimmelEtherCat strimmelEC;
+      strimmelEC.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+    }
+    else
+    {
+      PressureMeasurements pm;
+
+      pm.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+    }*/
+    
+    //try
+    //{
+    //  if (QPatchConfiguration::isEtherCatMasterUsed())
+    //  {
+    //    StrimmelEtherCat strimmelEC;
+    //    strimmelEC.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+    //  }
+    //  else
+    //  {
+    //    PressureMeasurements pm;
+    //    //pm.load(PresProtocolFILENAME);
+    //    pm.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+    //    
+    //  }
+
+    //}
+    //catch (const std::exception& e1)
+    //{
+    //  if (pPump != nullptr)
+    //  {
+    //    pPump->PowerPumps(false);
+    //  }
+
+    //  std::cout << "Exception" << e1.what() << "\n";
+
+    //  if (env.IsOpen())
+    //  {
+    //    env.UnLockChipOnAMP();
+    //  }
+    //  //std::cout << "Exception: " << e1.what() << "\n";
+
+    //  //return 0;//to stop the program in case of an exception
+    //}
+
+    
+    
+    
+        
+    std::cout << "*************************\n";
+    
+    
+    
+    std::cout << "Lock chip lock\n";
+    //int channel = 0;
+
+    env.LockChipOnAMP();
+    Sleep(3000);
+    std::cout << "Chip locked\n";
+
+    std::cout << "Start sweep on DSP\n";
+
+    /*dsp.SetSweepDataFilter((FILTER_TYPE)vp.samplingFilter.filterTypeID, (int)(vp.samplingFilter.filterOrderID)*2, vp.samplingFilter.filteringFrequencyHz, 50000/vp.samplingFilter.getSamplingFrequencyHz());
+
+    int sweepNumber = 0; 
+    U16 sweepCount = 0;
+    ASSAY::CompoundEndCriterion endCriterion = ASSAY::CompoundEndCriterion::STABLE_CURRENT_OR_MAX_VP_CVR;
+    U8 compoundPeriod = 0;*/
+
+    dsp.SetSweepDataFilter((FILTER_TYPE)vp.samplingFilter.filterTypeID, (int)(vp.samplingFilter.filterOrderID) * 2, vp.samplingFilter.filteringFrequencyHz, 50000 / vp.samplingFilter.getSamplingFrequencyHz());
+
+    int sweepNumber = 0;
+    U16 sweepCount = 0;
+    ASSAY::CompoundEndCriterion endCriterion = ASSAY::CompoundEndCriterion::STABLE_CURRENT_OR_MAX_VP_CVR;
+    U8 compoundPeriod = 0;
+
+
+
+    DSPAPI::AdvancedDataAcquisition adaq(vp, dsp.GetNumChannels(), *pPumpChannel, sweepNumber, sweepCount, endCriterion, compoundPeriod);
+    /*dsp.StartAdvancedDataAcquisition(adaq);*/
+    
+
+
+    //checking if the csv file is already exists,if so then create a new file with sequence number
+    
+    int i = 0;
+    for (i = 0; i < dsp.GetNumChannels(); i++)
+    {
+      //dataReceiverClass.dataReceivedEvent.Reset();
+      dsp.StartAdvancedDataAcquisition(adaq);
+
+
+      //*********************
+      pPump->PowerPumps(true);
+
+      if (QPatchConfiguration::isEtherCatMasterUsed())
+      {
+        StrimmelEtherCat strimmelEC;
+        strimmelEC.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+      }
+      else
+      {
+        PressureMeasurements pm;
+
+        pm.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+      }
+
+      
+
+      /*PressureMeasurements pm;
+
+      pm.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);*/
+      
+
+      //***********************
+
+
+
+      unsigned int fileSeq;
+      double zerotime2 = StdClass::GetUTCTime();
+
+      //creating a file to record data
+
+      std::ofstream myfileOut;// , std::ios::app;
+      std::ifstream myfileIn;
+      myfileIn.open("Recorded_PressureARQ_Output_Data.csv", std::ios_base::in);
+
+      // If "Recorded Current and Converted Pressure.csv" exists, read the last sequence from it and increment it by 1.
+      if (myfileIn.is_open())
+      {
+        myfileIn >> fileSeq;
+        fileSeq++;
+      }
+      else
+        fileSeq = 1;// if it does not exist, start from sequence 1
+
+    // Assume newDataAvailable = true
+      bool newDataAvailable = true;
+
+      if (newDataAvailable) {
+        
+        std::ofstream myfile;
+        std::string fileName = "Recorded_PressureARQ_Output_Data" + std::to_string(fileSeq) +/*StdClass::GetLocalTimeString*/ + ".csv";
+
+        std::cout << "Filename of QPatch Pressure ARQ test is " << fileName << std::endl;
+
+        myfile.open(fileName, std::ios_base::app);
+        //myfile << "Channel No:" << "," << *pPumpChannel << "\n" << "Voltage Protocol No : " << ", " << it->first <<","<<"Pressure Protocol filepath:"<<", "<< argv[1] <<"\n";
+        //dsp.m_dataReadyEvent.Attach(dataReceiverClass);//MAL to write 0 channel
+        myfile.close();
+
+        ///std::ofstream myfile("Recorded Current and Converted Pressure.csv", std::ios_base::app); //,std::ios::out
+        
+        
+
+        /*if (QPatchConfiguration::isEtherCatMasterUsed())
+        {
+          StrimmelEtherCat strimmelEC;
+          strimmelEC.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+        }
+        else
+        {
+          PressureMeasurements pm;
+
+          pm.samplePressureChannels(PresProtocolFilePath, repeats, outputDataPath, path);
+        }*/
+
+        
+        
+        //dataReceiverClass.storeSweepDataToFile(sweepCount,sweepNumber);
+        //dataReceiverClass.storeSweepDataToFile(pSweep, sweepCount);//MAL trial to access storetofile
+        /*dataReceiverClass.dataReceivedEvent.Reset();
+        dsp.StartAdvancedDataAcquisition(adaq);*/
+        
+        std::cout << "*************************\n";
+
+        std::cout << "Wait for sweep\n";
+
+        
+
+        DWORD timeOut_ms = 120000; // 2minutes time out Make sure that the length of the voltage protocol is less than 120 seconds
+        DWORD result = WaitForSingleObject(dataReceiverClass.dataReceivedEvent.GetEventHandle(), timeOut_ms);
+
+        if (result != WAIT_OBJECT_0)
+        {
+          throw std::exception("WaitForSingleObject failed");
+        }
+        std::cout << "Sweep received successfully\n";
+      }
+      /*myfileOut.open("Recorded_PressureARQ_Output_Data.csv", std::ios_base::out);
+      myfileOut << fileSeq;*/
+      (*pPumpChannel)++;//MAL
+      dataReceiverClass.dataReceivedEvent.Reset();
+    }///the end brake for "for" loop which writes the acquired data to csv file
+    
+
+    std::cout << "Unlock chip lock\n";
+    //pPump->SetPressure(pumpChannel, pressure_Pa, slope);
+    //std::cout << "Pressure on channel 0 is: " << pressure_Pa /100.0f << " mBar" << std::endl;
+    
+    env.UnLockChipOnAMP();
+    pPump->PowerPumps(false); //otherwise pump controller will remain on
+
+    std::cout << "Bye..\n";
+
+  }
+  catch (std::exception& e)
+  {
+    //int pumpChannel = 0;
+    if (pPump != nullptr)
+    {
+      //pPump->SetPressure(pumpChannel, 0, 0);
+      pPump->PowerPumps(false);
+    }
+    if (env.IsOpen())
+    {
+      env.UnLockChipOnAMP();
+    }
+    std::cout << "Exception: " << e.what()  <<"\n" ;
+  }
+  catch (...)
+  {
+    if (pPump != nullptr)
+    {
+      //int pumpChannel = 0;
+      //pPump->SetPressure(pumpChannel, 0, 0);
+      pPump->PowerPumps(false);
+    }
+    if (env.IsOpen())
+    {
+      env.UnLockChipOnAMP();
+    }
+    std::cout << "Unknown exception\n";
+  }
+
+  std::string tmp;
+  std::cin >> tmp;
+  return 0;
+
+  
+  
+}
+
+// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
+// Debug program: F5 or Debug > Start Debugging menu
+
+// Tips for Getting Started: 
+//   1. Use the Solution Explorer window to add/manage files
+//   2. Use the Team Explorer window to connect to source control
+//   3. Use the Output window to see build output and other messages
+//   4. Use the Error List window to view errors
+//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
+//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
